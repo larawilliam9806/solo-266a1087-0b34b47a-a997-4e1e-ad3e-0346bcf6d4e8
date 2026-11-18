@@ -19,6 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from wq_publish.app import create_app
 from wq_publish.storage import LIVE_FILENAME
 from wq_publish.validation import render_csv, validate_csv
+from wq_publish.qc import (
+    QCValidationError,
+    analyze_pairs,
+    minimum_vertex_cover,
+    relative_deviation,
+    validate_pair_csv,
+)
 
 PASS, FAIL = 0, 0
 EXAMPLE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -207,6 +214,173 @@ check("取消后发布被拒绝（409 且会话 cancelled）",
       and app.storage.get_session(tok)["status"] == "cancelled")
 check("取消不影响当前版本",
       app.storage.current_registry()["current_version"] == v_before)
+
+print("== 7. 平行样品质控：偏差计算与最小顶点覆盖 ==")
+check("双零浓度偏差为 0", relative_deviation(0.0, 0.0) == 0.0)
+check("偏差公式 2|a-b|/(a+b)",
+      abs(relative_deviation(10.0, 12.0) - 4.0 / 22.0) < 1e-12)
+check("三角形 K3 字典序最小覆盖 [a,b]",
+      minimum_vertex_cover(list("abc"),
+                           [("a", "b"), ("b", "c"), ("a", "c")]) == ["a", "b"])
+check("P4 字典序最小覆盖 [a,c]",
+      minimum_vertex_cover(list("abcd"),
+                           [("a", "b"), ("b", "c"), ("c", "d")]) == ["a", "c"])
+check("独立边覆盖取每边小端",
+      minimum_vertex_cover(list("abcd"),
+                           [("a", "b"), ("c", "d")]) == ["a", "c"])
+check("mandatory 顶点强制入选",
+      minimum_vertex_cover(list("abcd"), [("a", "b"), ("c", "d")],
+                           mandatory={"d"}) == ["a", "d"])
+check("空图覆盖为空", minimum_vertex_cover([], []) == [])
+
+import itertools
+import random as _random
+_random.seed(42)
+brute_ok = True
+for _trial in range(120):
+    nn = _random.randint(1, 9)
+    vv = list(range(nn))
+    ee = set()
+    for _ in range(nn * 2):
+        if nn >= 2:
+            ee.add(tuple(sorted(_random.sample(vv, 2))))
+    mand = set(_random.sample(vv, _random.randint(0, min(2, nn))))
+    got = minimum_vertex_cover(vv, list(ee), mandatory=mand)
+    want = None
+    for rr in range(nn + 1):
+        for sub in itertools.combinations(vv, rr):
+            ss = set(sub)
+            if mand <= ss and all(u in ss or v in ss for u, v in ee):
+                want = list(sub)
+                break
+        if want is not None:
+            break
+    if got != want:
+        brute_ok = False
+        break
+check("120 组随机图与暴力枚举一致（最小且字典序最小）", brute_ok)
+
+print("== 8. 配对 CSV 校验 ==")
+pairs = validate_pair_csv(read_example("parallel_pairs.csv"))
+check("合法配对 CSV 解析 3 对", len(pairs) == 3 and pairs[0]["limit"] == 0.1)
+try:
+    validate_pair_csv(read_example("parallel_pairs_invalid.csv"))
+    check("非法配对 CSV 被拒", False)
+except QCValidationError as exc:
+    joined = " ".join(exc.messages)
+    check("相同样本/重复配对/负限值/非数字全部被拒",
+          all(k in joined for k in ("不能相同", "重复", "负数", "不是合法数字")),
+      str(exc.messages))
+
+for raw_text, key in [
+    ("样本甲,样本乙,检测项目,允许相对偏差\nS1,S2,氨氮,nan\n", "NaN"),
+    ("样本甲,样本乙,检测项目,允许相对偏差\nS1,S2,氨氮,inf\n", "Inf"),
+    ("样本甲,样本乙,检测项目\nS1,S2,氨氮\n", "缺列"),
+]:
+    try:
+        validate_pair_csv(raw_text.encode())
+        check(f"非法限值/表头被拒（{key}）", False)
+    except QCValidationError:
+        check(f"非法限值/表头被拒（{key}）", True)
+
+over60 = "样本甲,样本乙,检测项目,允许相对偏差\n" + "".join(
+    f"S{i},S{i+1},氨氮,0.1\n" for i in range(61))
+try:
+    validate_pair_csv(over60.encode())
+    check("超过 60 对被拒", False)
+except QCValidationError as exc:
+    check("超过 60 对被拒", any("60" in m for m in exc.messages))
+
+over24 = "样本甲,样本乙,检测项目,允许相对偏差\n" + "".join(
+    f"A{i},B{i},COD,0.1\n" for i in range(13))
+try:
+    validate_pair_csv(over24.encode())
+    check("超过 24 键被拒", False)
+except QCValidationError as exc:
+    check("超过 24 键被拒", any("24" in m for m in exc.messages))
+
+print("== 9. 质控页面端到端（版本快照/缺失/超限/最少核查） ==")
+resp = client.get("/qc")
+check("质控页 200 且列出已发布版本",
+      resp.status_code == 200 and b'name="version"' in resp.data)
+
+resp = client.post("/qc/report", data={
+    "version": "999",
+    "pair_csv": (io.BytesIO(read_example("parallel_pairs.csv")), "p.csv"),
+}, content_type="multipart/form-data")
+check("不存在版本被拒（400 无报告）",
+      resp.status_code == 400 and "不存在".encode() in resp.data)
+
+resp = client.post("/qc/report", data={
+    "version": "1",
+    "pair_csv": (io.BytesIO(read_example("parallel_pairs_invalid.csv")), "bad.csv"),
+}, content_type="multipart/form-data")
+check("无效上传不生成报告（400 且回到质控表单页）",
+      resp.status_code == 400 and b'name="pair_csv"' in resp.data
+      and "不能相同".encode() in resp.data and "重复".encode() in resp.data
+      and "负数".encode() in resp.data and "不是合法数字".encode() in resp.data)
+
+# v1 数据：S001 氨氮 1.25 / S002 氨氮 2.10（偏差 0.5075>0.1 超限）；
+# S001 总磷 0.08 / S003 总磷 0（偏差 2.0>0.15 超限）；
+# S002 COD 35.0 / S004 COD 在 v1 缺失 → (S004,COD) 强制核查
+resp = client.post("/qc/report", data={
+    "version": "1",
+    "pair_csv": (io.BytesIO(read_example("parallel_pairs.csv")), "p.csv"),
+}, content_type="multipart/form-data")
+body = resp.data.decode()
+check("合法报告 200 并标明 v1",
+      resp.status_code == 200 and "质控报告".encode() in resp.data and "v1" in body)
+check("展示实测偏差 50.75%", "50.75%" in body)
+check("缺失端展示原因且不按 0 计算",
+      "缺失".encode() in resp.data and "不按 0 计算".encode() in resp.data)
+check("给出最少待核查键集合", "最少待核查".encode() in resp.data)
+
+# 直接验证分析结果的集合语义：两条超限边 + 一个缺失强制键
+pairs_v1 = validate_pair_csv(read_example("parallel_pairs.csv"))
+report = analyze_pairs(pairs_v1, app.storage.version_rows(1))
+exceeded_edges = [
+    (r["key_a"], r["key_b"]) for r in report["results"] if r["status"] == "exceeded"
+]
+# 边1：(S001,氨氮)-(S002,氨氮)；边2：(S001,总磷)-(S003,总磷)；
+# 最小覆盖可取 (S001,氨氮) 与 (S001,总磷)（共 2 个），加缺失键 (S004,COD) 共 3 个
+check("超限边识别为 2 条", len(exceeded_edges) == 2, str(exceeded_edges))
+check("最少核查集合大小为 3（2 覆盖 + 1 强制缺失）",
+      len(report["check_keys"]) == 3, str(report["check_keys"]))
+check("缺失键强制在集合中", ("S004", "COD") in report["check_keys"])
+check("集合按键排序",
+      report["check_keys"] == sorted(report["check_keys"]))
+
+# 双零：v1 中 S003 总磷为 0，构造同项目两个零样本（补一个零浓度行做纯函数验证）
+zero_report = analyze_pairs(
+    validate_pair_csv(
+        "样本甲,样本乙,检测项目,允许相对偏差\nZA,ZB,总磷,0.05\n".encode()),
+    [
+        {"sample_no": "ZA", "analyte": "总磷", "concentration": 0.0},
+        {"sample_no": "ZB", "analyte": "总磷", "concentration": 0.0},
+    ],
+)
+check("两浓度均为 0 时偏差 0 且不超限",
+      zero_report["results"][0]["deviation"] == 0.0
+      and zero_report["results"][0]["status"] == "ok"
+      and zero_report["check_keys"] == [])
+
+# 分析期间继续发布：再发 v4，旧 v1 报告内容不变，页面提示当前版本已更新
+v_now = app.storage.current_registry()["current_version"]
+r = upload(client, "batch_v2_revision.csv", "QC-CONCURRENT")
+tok = re.search(rb'/publish/([0-9a-f]+)', r.data).group(1).decode()
+client.post(f"/publish/{tok}")
+check("分析期间可继续发布",
+      app.storage.current_registry()["current_version"] == v_now + 1)
+report_before = analyze_pairs(pairs_v1, app.storage.version_rows(1))
+resp = client.post("/qc/report", data={
+    "version": "1",
+    "pair_csv": (io.BytesIO(read_example("parallel_pairs.csv")), "p.csv"),
+}, content_type="multipart/form-data")
+report_after = analyze_pairs(pairs_v1, app.storage.version_rows(1))
+check("旧版本报告只使用所选快照（结果不随后续发布变化）",
+      report_before["check_keys"] == report_after["check_keys"]
+      and f"v{v_now + 1}".encode() in resp.data
+      and "不受影响".encode() in resp.data)
 
 shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n结果：{PASS} 通过，{FAIL} 失败")

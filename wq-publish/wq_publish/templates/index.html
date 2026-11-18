@@ -21,6 +21,16 @@
 </div>
 
 <div class="card">
+  <h2>平行样品质控</h2>
+  <p class="muted" style="margin-top:0">
+    选择已发布版本并上传配对 CSV（样本甲、样本乙、检测项目、允许相对偏差），
+    逐对计算相对偏差并给出最少待核查（样本号、检测项目）键集合；
+    报告只使用所选版本快照，分析期间可继续发布。
+  </p>
+  <a href="{{ url_for('qc_page') }}"><button type="button">进入质控页</button></a>
+</div>
+
+<div class="card">
   <h2>发起批次修订</h2>
   <form method="post" action="{{ url_for('preview') }}" enctype="multipart/form-data">
     <label for="batch_no">批次号</label>

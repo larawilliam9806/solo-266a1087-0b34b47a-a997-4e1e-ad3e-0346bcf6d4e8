@@ -18,6 +18,13 @@ from flask import (
 
 from .storage import LIVE_FILENAME, PublishConflictError, Storage
 from .validation import format_concentration, validate_csv
+from .qc import (
+    MAX_DISTINCT_KEYS,
+    MAX_PAIRS,
+    QCValidationError,
+    analyze_pairs,
+    validate_pair_csv,
+)
 
 MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 
@@ -52,6 +59,13 @@ def create_app(data_dir: str | None = None, downstream_dir: str | None = None) -
     @app.template_filter("conc")
     def _conc(value):
         return format_concentration(value)
+
+    @app.template_filter("pct")
+    def _pct(value):
+        """相对偏差比率（0..1）→ 百分比文本；None 显示占位。"""
+        if value is None:
+            return "—"
+        return f"{value * 100:.2f}%"
 
     @app.get("/")
     def index():
@@ -170,6 +184,62 @@ def create_app(data_dir: str | None = None, downstream_dir: str | None = None) -
         return send_file(
             storage.live_path, mimetype="text/csv",
             download_name=LIVE_FILENAME, as_attachment=False,
+        )
+
+    # ---------------- 平行样品质控 ----------------
+    @app.get("/qc")
+    def qc_page():
+        versions = storage.list_versions()
+        return render_template("qc.html", versions=versions)
+
+    @app.post("/qc/report")
+    def qc_report():
+        versions = storage.list_versions()
+        version_text = request.form.get("version", "").strip()
+        upload = request.files.get("pair_csv")
+
+        def _back(messages):
+            for msg in messages:
+                flash(msg, "error")
+            return render_template("qc.html", versions=versions), 400
+
+        if not version_text or not version_text.lstrip("-").isdigit():
+            return _back(["请选择一个已发布版本作为质控分析基线"])
+        version = int(version_text)
+        version_reg = storage.version_registry(version)
+        if version_reg is None:
+            return _back([f"所选版本 v{version} 不存在，请重新选择已发布版本"])
+
+        if upload is None or not upload.filename:
+            return _back(["请选择配对 CSV 文件"])
+        raw = upload.read()
+        if len(raw) > MAX_UPLOAD_BYTES:
+            return _back(["CSV 文件超过 16MB 上限"])
+
+        try:
+            pairs = validate_pair_csv(raw)
+        except QCValidationError as exc:
+            # 无效上传：不生成报告，仅回表单页展示带行号的错误
+            return _back(exc.messages)
+
+        # 只读取所选版本的不可变快照；分析期间即使有新发布也不影响本报告
+        snapshot_rows = storage.version_rows(version)
+        report = analyze_pairs(pairs, snapshot_rows)
+        storage.log(
+            "qc",
+            f"质控报告基于 v{version}：{len(pairs)} 对，"
+            f"超限 {sum(1 for r in report['results'] if r['status'] == 'exceeded')} 对，"
+            f"缺失 {len(report['mandatory_keys'])} 键，"
+            f"最少核查 {len(report['check_keys'])} 个键",
+        )
+        return render_template(
+            "qc_report.html",
+            version_reg=version_reg,
+            current_reg=storage.current_registry(),
+            pairs=pairs,
+            report=report,
+            max_pairs=MAX_PAIRS,
+            max_keys=MAX_DISTINCT_KEYS,
         )
 
     @app.errorhandler(413)

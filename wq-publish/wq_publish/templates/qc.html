@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}平行样品质控 · 水质批次修订发布{% endblock %}
+{% block content %}
+
+<div class="card">
+  <h2>平行样本检测一致性质控</h2>
+  <p class="muted" style="margin-top:0">
+    选择一个<strong>已发布版本</strong>作为分析基线，上传配对 CSV。
+    分析期间其他页面仍可继续发布；本报告只使用所选版本的不可变快照，并在报告中标明版本。
+    无效上传不会生成报告。
+  </p>
+  <form method="post" action="{{ url_for('qc_report') }}" enctype="multipart/form-data">
+    <label for="version">分析基线版本（报告仅使用该版本数据）</label>
+    {% if versions %}
+    <select id="version" name="version" required
+            style="width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:7px;font-size:14px">
+      {% for v in versions %}
+      <option value="{{ v.version }}">
+        v{{ v.version }} · 批次 {{ v.batch_no }} · {{ v.row_count }} 行 · {{ v.published_at }}
+      </option>
+      {% endfor %}
+    </select>
+    {% else %}
+    <p class="flash error" style="margin:8px 0 0">尚无任何已发布版本，请先在首页发布一批检测结果后再做质控。</p>
+    {% endif %}
+
+    <label for="pair_csv">配对 CSV（表头需含：样本甲 / 样本乙 / 检测项目 / 允许相对偏差，兼容中英文表头）</label>
+    <input type="file" id="pair_csv" name="pair_csv" accept=".csv,text/csv" required>
+
+    <p class="muted">
+      规则：最多 60 对、涉及最多 24 个不同的（样本号、检测项目）键；两样本不能相同；
+      同项目的无序配对不可重复；允许相对偏差须为非负有限数（按比率填写，例如
+      <code>0.1</code> 表示 10%）。<br>
+      相对偏差：两浓度均为 0 时偏差为 0，否则
+      <code>2×|甲−乙|/(甲＋乙)</code>；偏差<strong>严格大于</strong>限值的配对至少核查一端；
+      任一端在所选版本缺失时该键必须核查，不按 0 计算。
+    </p>
+    <button type="submit" {% if not versions %}disabled{% endif %}>生成质控报告</button>
+    <a href="{{ url_for('index') }}"><button type="button" class="ghost">返回首页</button></a>
+  </form>
+</div>
+
+{% endblock %}

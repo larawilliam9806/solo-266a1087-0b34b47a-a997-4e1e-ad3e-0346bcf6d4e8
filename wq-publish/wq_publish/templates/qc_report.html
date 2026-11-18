@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}质控报告 v{{ version_reg.version }} · 水质批次修订发布{% endblock %}
+{% block content %}
+
+<div class="card">
+  <h2>平行样品质控报告</h2>
+  <div class="meta">
+    <div><b>报告所用版本（不可变快照）</b><span>v{{ version_reg.version }}</span></div>
+    <div><b>版本批次号</b><span>{{ version_reg.batch_no }}</span></div>
+    <div><b>版本发布时间 (UTC)</b><span>{{ version_reg.published_at }}</span></div>
+    <div><b>版本行数</b><span>{{ version_reg.row_count }}</span></div>
+    <div><b>当前最新版本</b>
+      <span>{% if current_reg %}v{{ current_reg.current_version }}{% else %}无{% endif %}</span>
+    </div>
+  </div>
+  <p class="muted" style="margin-bottom:0">
+    本报告只读取 <strong>v{{ version_reg.version }}</strong> 的数据；
+    {% if current_reg and current_reg.current_version != version_reg.version %}
+    分析期间已出现更新的发布（当前 v{{ current_reg.current_version }}），但本报告结果不受影响，
+    如需基于最新版本分析请重新生成。
+    {% else %}
+    分析期间即使有新发布，本报告结果也不会变化。
+    {% endif %}
+  </p>
+</div>
+
+<div class="card">
+  <h2>汇总</h2>
+  {% set n_exceeded = report.results | selectattr('status','equalto','exceeded') | list | length %}
+  {% set n_missing = report.results | selectattr('status','equalto','missing') | list | length %}
+  {% set n_ok = report.results | selectattr('status','equalto','ok') | list | length %}
+  <div class="meta">
+    <div><b>配对总数</b><span>{{ pairs|length }}</span></div>
+    <div><b>超限配对</b><span style="color:var(--red)">{{ n_exceeded }}</span></div>
+    <div><b>含缺失端配对</b><span style="color:var(--amber)">{{ n_missing }}</span></div>
+    <div><b>合格配对</b><span style="color:var(--green)">{{ n_ok }}</span></div>
+    <div><b>最少待核查键</b><span>{{ report.check_keys|length }} 个</span></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>最少待核查（样本号、检测项目）键集合</h2>
+  <p class="muted" style="margin-top:0">
+    每个超限配对至少核查一端（最小顶点覆盖）；缺失端所在键强制纳入。
+    若存在多个等优集合，本结果为按键排序后字典序最小者。
+  </p>
+  {% if report.check_keys %}
+  <table>
+    <thead><tr><th style="width:60px">序号</th><th>样本号</th><th>检测项目</th><th>纳入原因</th></tr></thead>
+    <tbody>
+    {% for key in report.check_keys %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{{ key[0] }}</td>
+        <td>{{ key[1] }}</td>
+        <td>
+          {% if key in report.mandatory_keys %}
+            <span class="tag upd">版本缺失，强制核查</span>
+          {% else %}
+            <span class="tag del">超限配对端点</span>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted" style="margin-bottom:0">没有超限或缺失项，无需安排核查。</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>逐对明细（{{ pairs|length }} 对）</h2>
+  <div class="scroll">
+  <table>
+    <thead>
+      <tr>
+        <th style="width:56px">行号</th><th>样本甲</th><th>样本乙</th><th>检测项目</th>
+        <th>甲浓度</th><th>乙浓度</th><th>允许相对偏差</th><th>实测相对偏差</th>
+        <th>结论 / 缺失原因</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in report.results %}
+      <tr>
+        <td>{{ r.line_no }}</td>
+        <td>{{ r.sample_a }}{% if r.missing_a %} <span class="tag upd">缺失</span>{% endif %}</td>
+        <td>{{ r.sample_b }}{% if r.missing_b %} <span class="tag upd">缺失</span>{% endif %}</td>
+        <td>{{ r.analyte }}</td>
+        <td>{{ r.conc_a|conc if r.conc_a is not none else "—" }}</td>
+        <td>{{ r.conc_b|conc if r.conc_b is not none else "—" }}</td>
+        <td>{{ r.limit|pct }}</td>
+        <td>
+          {% if r.deviation is not none %}
+            <strong {% if r.exceeded %}style="color:var(--red)"{% endif %}>{{ r.deviation|pct }}</strong>
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if r.status == 'exceeded' %}
+            <span class="tag del">超限</span>
+          {% elif r.status == 'missing' %}
+            <span class="tag upd">缺失</span>
+          {% else %}
+            <span class="tag same">合格</span>
+          {% endif %}
+          <span class="muted">{{ r.reason }}</span>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="muted" style="margin-bottom:0;margin-top:10px">
+    实测相对偏差按 <code>2×|甲−乙|/(甲＋乙)</code> 计算（两浓度均为 0 时记为 0），
+    页面以百分比展示；判定时与限值按同一比率尺度比较，偏差严格大于限值即超限。
+  </p>
+</div>
+
+<div class="actions">
+  <a href="{{ url_for('qc_page') }}"><button type="button" class="ghost">发起新的质控分析</button></a>
+  <a href="{{ url_for('index') }}"><button type="button" class="ghost">返回首页</button></a>
+</div>
+
+{% endblock %}

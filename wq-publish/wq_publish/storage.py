@@ -90,8 +90,50 @@ class Storage:
                     kind TEXT NOT NULL,
                     detail TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS published_versions (
+                    version INTEGER PRIMARY KEY,
+                    batch_no TEXT NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    published_at TEXT NOT NULL,
+                    content_hash TEXT NOT NULL
+                );
                 """
             )
+            self._backfill_versions(conn)
+
+    def _backfill_versions(self, conn: sqlite3.Connection) -> None:
+        """老库升级：按 results 表中出现过的版本补登 published_versions。"""
+        existing = {
+            r["version"]
+            for r in conn.execute("SELECT version FROM published_versions").fetchall()
+        }
+        rows = conn.execute(
+            "SELECT version, batch_no, COUNT(*) AS cnt FROM results "
+            "GROUP BY version, batch_no ORDER BY version"
+        ).fetchall()
+        reg = conn.execute("SELECT * FROM registry WHERE id = 1").fetchone()
+        for r in rows:
+            if r["version"] in existing:
+                continue
+            if reg is not None and r["version"] == reg["current_version"]:
+                conn.execute(
+                    "INSERT INTO published_versions(version, batch_no, row_count,"
+                    " published_at, content_hash) VALUES (?,?,?,?,?)",
+                    (reg["current_version"], reg["batch_no"], reg["row_count"],
+                     reg["published_at"], reg["content_hash"]),
+                )
+            else:
+                # 历史版本无单独登记时间/哈希：以可重渲染内容计算哈希，时间标注为补登
+                csv_text = self._render_version(conn, r["version"])
+                content_hash = hashlib.sha256(
+                    csv_text.encode("utf-8")
+                ).hexdigest()
+                conn.execute(
+                    "INSERT INTO published_versions(version, batch_no, row_count,"
+                    " published_at, content_hash) VALUES (?,?,?,?,?)",
+                    (r["version"], r["batch_no"], r["cnt"],
+                     _now() + "(backfill)", content_hash),
+                )
 
     def _log(self, conn: sqlite3.Connection, kind: str, detail: str) -> None:
         conn.execute(
@@ -241,6 +283,27 @@ class Storage:
             (version,),
         )
         return [dict(r) for r in cur.fetchall()]
+
+    def list_versions(self) -> list[dict]:
+        """全部历史发布版本（新版本在前），供质控页选择分析基线。"""
+        with self._connect() as conn:
+            return [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM published_versions ORDER BY version DESC"
+                ).fetchall()
+            ]
+
+    def version_registry(self, version: int):
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM published_versions WHERE version = ?", (version,)
+            ).fetchone()
+
+    def version_rows(self, version: int) -> list[dict]:
+        """读取指定历史版本的检测结果（质控报告只使用该快照，不随后续发布变化）。"""
+        with self._connect() as conn:
+            return self._version_rows(conn, version)
 
     def _render_version(self, conn: sqlite3.Connection, version: int) -> str:
         return render_csv(self._version_rows(conn, version))
@@ -396,6 +459,11 @@ class Storage:
                 "ON CONFLICT(id) DO UPDATE SET current_version=excluded.current_version,"
                 " batch_no=excluded.batch_no, row_count=excluded.row_count,"
                 " published_at=excluded.published_at, content_hash=excluded.content_hash",
+                (new_version, session["batch_no"], len(rows), _now(), content_hash),
+            )
+            conn.execute(
+                "INSERT INTO published_versions(version, batch_no, row_count,"
+                " published_at, content_hash) VALUES (?,?,?,?,?)",
                 (new_version, session["batch_no"], len(rows), _now(), content_hash),
             )
             conn.execute(
